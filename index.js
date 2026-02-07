@@ -498,7 +498,7 @@ app.post('/slack/command', (req, res, next) => {
 
     // レスポンスを返して終了（ここでVercelがフリーズしてもOK）
     res.status(200).json({
-      response_type: 'ephemeral',
+      response_type: 'in_channel',
       text: msg
     });
   } catch (err) {
