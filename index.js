@@ -200,8 +200,12 @@ async function getUserIdByName(ownerName) {
   if (!token) return null;
 
   try {
+    console.log('[DEBUG] getUserIdByName: Starting for', ownerName);
+
     // 「winova_slack✖️todoist」プロジェクト内の「ID取得用」タスクを検索
     const projects = await getTodoistProjects();
+    console.log('[DEBUG] getUserIdByName: Got projects');
+
     const targetProject = projects.find(p => p.name === 'winova_slack✖️todoist');
 
     if (!targetProject) {
@@ -209,14 +213,20 @@ async function getUserIdByName(ownerName) {
       return null;
     }
 
+    console.log('[DEBUG] getUserIdByName: Found target project');
+
     // プロジェクト内のタスクを取得
     const tasksRes = await fetch(`https://api.todoist.com/rest/v2/tasks?project_id=${targetProject.id}`, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
 
+    console.log('[DEBUG] getUserIdByName: Tasks fetch status:', tasksRes.status);
+
     if (!tasksRes.ok) return null;
 
     const tasks = await tasksRes.json();
+    console.log('[DEBUG] getUserIdByName: Got tasks, count:', tasks.length);
+
     const idTask = tasks.find(t => t.content.includes('ID取得'));
 
     if (!idTask) {
@@ -224,14 +234,20 @@ async function getUserIdByName(ownerName) {
       return null;
     }
 
+    console.log('[DEBUG] getUserIdByName: Found ID task:', idTask.id);
+
     // タスクのコメントを取得
     const commentsRes = await fetch(`https://api.todoist.com/rest/v2/comments?task_id=${idTask.id}`, {
       headers: { 'Authorization': `Bearer ${token}` }
     });
 
+    console.log('[DEBUG] getUserIdByName: Comments fetch status:', commentsRes.status);
+
     if (!commentsRes.ok) return null;
 
     const comments = await commentsRes.json();
+    console.log('[DEBUG] getUserIdByName: Got comments, count:', comments.length);
+
     if (comments.length === 0) {
       console.warn('[WARN] ID取得用タスクにコメントがありません');
       return null;
@@ -262,6 +278,7 @@ async function getUserIdByName(ownerName) {
     userIdCacheAt = Date.now();
 
     console.log('[DEBUG] User ID mapping:', userMapping);
+    console.log('[DEBUG] getUserIdByName: Returning ID for', ownerName, ':', userMapping[ownerName] || null);
 
     return userMapping[ownerName] || null;
 
