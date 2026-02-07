@@ -10,14 +10,17 @@ const PORT = process.env.PORT || 3000;
 // 担当者マッピング（config/owners.json）
 // ownerAliases: 苗字 or 短い名前 → フルネーム（1対1）
 // ambiguousFamilyNames: 同姓が複数いる苗字 → [フルネーム, ...]。苗字だけ指定されたら必ず聞き返す
+// ownerToTodoistId: フルネーム → Todoist ユーザー ID
 let ownerAliases = {};
 let ownerToSlackId = {};
+let ownerToTodoistId = {};
 let ambiguousFamilyNames = {};
 try {
   const configPath = path.join(__dirname, 'config', 'owners.json');
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   ownerAliases = config.ownerAliases || {};
   ownerToSlackId = config.ownerToSlackId || {};
+  ownerToTodoistId = config.ownerToTodoistId || {};
   ambiguousFamilyNames = config.ambiguousFamilyNames || {};
 } catch (e) {
   console.warn('config/owners.json が読めません（担当エイリアス・リマインド用）:', e.message);
@@ -115,12 +118,21 @@ function parseTaskText(text) {
 }
 
 // Slack リクエスト検証（署名シークレット）
-function verifySlackRequest(rawBody, signature) {
+function verifySlackRequest(rawBody, signature, timestamp) {
   const signingSecret = process.env.SLACK_SIGNING_SECRET;
   if (!signingSecret) return true; // 未設定の場合は検証スキップ（開発用）
 
   if (!signature || !signature.startsWith('v0=')) return false;
-  const sigBasestring = `v0:${rawBody}`;
+  if (!timestamp) return false;
+
+  // タイムスタンプチェック（5分以内のリクエストのみ受け付ける）
+  const currentTime = Math.floor(Date.now() / 1000);
+  if (Math.abs(currentTime - timestamp) > 60 * 5) {
+    console.warn('Request timestamp is too old');
+    return false;
+  }
+
+  const sigBasestring = `v0:${timestamp}:${rawBody}`;
   const mySig = 'v0=' + crypto
     .createHmac('sha256', signingSecret)
     .update(sigBasestring)
@@ -152,7 +164,10 @@ async function resolveProjectId(projectName) {
   if (!projectName || !projectName.trim()) return null;
   const name = projectName.trim();
   const projects = await getTodoistProjects();
+  console.log(`[DEBUG] Searching for project: "${name}"`);
+  console.log(`[DEBUG] Available projects:`, projects.map(p => p.name));
   const match = projects.find((p) => p.name === name || p.name.includes(name) || name.includes(p.name));
+  console.log(`[DEBUG] Match found:`, match ? match.name : 'none');
   return match ? match.id : null;
 }
 
@@ -168,6 +183,95 @@ function extractProjectName(text) {
   return null;
 }
 
+// 担当者名から Todoist ユーザー ID を動的に取得（「ID取得用(編集しないで)」プロジェクトから）
+let userIdCache = null;
+let userIdCacheAt = 0;
+const USER_ID_CACHE_MS = 10 * 60 * 1000; // 10分キャッシュ
+
+async function getUserIdByName(ownerName) {
+  if (!ownerName) return null;
+
+  // キャッシュをチェック
+  if (userIdCache && Date.now() - userIdCacheAt < USER_ID_CACHE_MS) {
+    return userIdCache[ownerName] || null;
+  }
+
+  const token = process.env.TODOIST_TOKEN;
+  if (!token) return null;
+
+  try {
+    // 「winova_slack✖️todoist」プロジェクト内の「ID取得用」タスクを検索
+    const projects = await getTodoistProjects();
+    const targetProject = projects.find(p => p.name === 'winova_slack✖️todoist');
+
+    if (!targetProject) {
+      console.warn('[WARN] winova_slack✖️todoist プロジェクトが見つかりません');
+      return null;
+    }
+
+    // プロジェクト内のタスクを取得
+    const tasksRes = await fetch(`https://api.todoist.com/rest/v2/tasks?project_id=${targetProject.id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!tasksRes.ok) return null;
+
+    const tasks = await tasksRes.json();
+    const idTask = tasks.find(t => t.content.includes('ID取得'));
+
+    if (!idTask) {
+      console.warn('[WARN] ID取得用のタスクが見つかりません');
+      return null;
+    }
+
+    // タスクのコメントを取得
+    const commentsRes = await fetch(`https://api.todoist.com/rest/v2/comments?task_id=${idTask.id}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+
+    if (!commentsRes.ok) return null;
+
+    const comments = await commentsRes.json();
+    if (comments.length === 0) {
+      console.warn('[WARN] ID取得用タスクにコメントがありません');
+      return null;
+    }
+
+    // コメントからユーザー名と ID のマッピングを作成
+    const userMapping = {};
+    comments.forEach(comment => {
+      const content = comment.content || '';
+      // [名前](todoist-mention://ID) の形式をパース
+      const mentionRegex = /\[([^\]]+)\]\(todoist-mention:\/\/(\d+)\)/g;
+      let match;
+      while ((match = mentionRegex.exec(content)) !== null) {
+        const name = match[1];
+        const id = match[2];
+        userMapping[name] = id;
+
+        // 名前のバリエーションも登録（「谷田倖輝/koki.yata」→「谷田倖輝」）
+        const simpleName = name.split('/')[0].trim();
+        if (simpleName !== name) {
+          userMapping[simpleName] = id;
+        }
+      }
+    });
+
+    // キャッシュを更新
+    userIdCache = userMapping;
+    userIdCacheAt = Date.now();
+
+    console.log('[DEBUG] User ID mapping:', userMapping);
+
+    return userMapping[ownerName] || null;
+
+  } catch (error) {
+    console.error('[ERROR] Failed to fetch user IDs:', error.message);
+    return null;
+  }
+}
+
+
 // Todoist にタスクを作成
 async function createTodoistTask(content, options = {}) {
   const token = process.env.TODOIST_TOKEN;
@@ -177,8 +281,11 @@ async function createTodoistTask(content, options = {}) {
     content: (content && content.trim()) ? content.trim() : '（Slackから追加）',
     ...(options.project_id && { project_id: options.project_id }),
     ...(options.due_string && { due_string: options.due_string, due_lang: 'ja' }),
+    ...(options.assignee_id && { assignee_id: options.assignee_id }),
     ...(options.description && { description: options.description }),
   };
+
+  console.log('[DEBUG] Creating Todoist task with body:', JSON.stringify(body, null, 2));
 
   const res = await fetch('https://api.todoist.com/rest/v2/tasks', {
     method: 'POST',
@@ -208,8 +315,10 @@ app.post('/slack/command', (req, res, next) => {
 }, async (req, res) => {
   const rawBody = req.rawBody;
   const signature = req.headers['x-slack-signature'];
+  const timestamp = req.headers['x-slack-request-timestamp'];
 
-  if (process.env.SLACK_SIGNING_SECRET && !verifySlackRequest(rawBody, signature)) {
+  if (process.env.SLACK_SIGNING_SECRET && !verifySlackRequest(rawBody, signature, timestamp)) {
+    console.error('Signature verification failed');
     return res.status(401).send('Invalid signature');
   }
 
@@ -234,6 +343,8 @@ app.post('/slack/command', (req, res, next) => {
   };
 
   const { content, dueString, ownerName, ownerAmbiguous, projectName } = parseTaskText(text);
+  console.log(`[DEBUG] Parsed text: "${text}"`);
+  console.log(`[DEBUG] content: "${content}", dueString: "${dueString}", ownerName: "${ownerName}", projectName: "${projectName}"`);
 
   // 期日がないとタスク化しない
   if (!dueString) {
@@ -255,16 +366,32 @@ app.post('/slack/command', (req, res, next) => {
   }
 
   try {
-    const projectId = projectName ? await resolveProjectId(projectName) : null;
+    // プロジェクトの決定: 明示的な指定がなければ winova_slack✖️todoist を使用
+    let finalProjectName = projectName;
+    if (!finalProjectName) {
+      finalProjectName = 'winova_slack✖️todoist';
+    }
+    console.log(`[DEBUG] Using project: ${finalProjectName}`);
+
+    const projectId = finalProjectName ? await resolveProjectId(finalProjectName) : null;
+    console.log(`[DEBUG] finalProjectName: ${finalProjectName}, projectId: ${projectId}`);
+
+    // 担当者の Todoist ID を動的に取得
+    const assigneeId = ownerName ? await getUserIdByName(ownerName) : null;
+    console.log(`[DEBUG] ownerName: ${ownerName}, assigneeId: ${assigneeId}`);
+
     const task = await createTodoistTask(content, {
       due_string: dueString,
       due_lang: 'ja',
       ...(projectId && { project_id: projectId }),
-      ...(ownerName && { description: `担当: ${ownerName}` }),
+      ...(assigneeId && { assignee_id: assigneeId }),
+      // assignee_id がない場合は description にフォールバック
+      ...(!assigneeId && ownerName && { description: `担当: ${ownerName}` }),
     });
+
     let msg = `✅ Todoistにタスクを追加しました: *${task.content}*\n期日: ${dueString}`;
     if (ownerName) msg += `\n担当: ${ownerName}`;
-    if (projectName) msg += `\nプロジェクト: ${projectName}`;
+    if (finalProjectName) msg += `\nプロジェクト: ${finalProjectName}`;
     if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
     sendToSlack({ response_type: 'ephemeral', text: msg });
   } catch (err) {
