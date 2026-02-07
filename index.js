@@ -147,28 +147,64 @@ let projectsCacheAt = 0;
 const PROJECTS_CACHE_MS = 5 * 60 * 1000;
 
 async function getTodoistProjects() {
-  if (projectsCache && Date.now() - projectsCacheAt < PROJECTS_CACHE_MS) return projectsCache;
+  console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Starting`);
+  if (projectsCache && Date.now() - projectsCacheAt < PROJECTS_CACHE_MS) {
+    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Returning cached projects`);
+    return projectsCache;
+  }
   const token = process.env.TODOIST_TOKEN;
-  if (!token) return [];
-  const res = await fetch('https://api.todoist.com/rest/v2/projects', {
-    headers: { 'Authorization': `Bearer ${token}` },
-  });
-  if (!res.ok) return [];
-  projectsCache = await res.json();
-  projectsCacheAt = Date.now();
-  return projectsCache;
+  if (!token) {
+    console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: No TODOIST_TOKEN`);
+    return [];
+  }
+
+  try {
+    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Fetching from API`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒タイムアウト
+
+    const res = await fetch('https://api.todoist.com/rest/v2/projects', {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Response status ${res.status}`);
+    if (!res.ok) {
+      console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: API returned ${res.status}`);
+      return [];
+    }
+    projectsCache = await res.json();
+    projectsCacheAt = Date.now();
+    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Success, ${projectsCache.length} projects`);
+    return projectsCache;
+  } catch (error) {
+    console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: ${error.message}`);
+    console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: Stack:`, error.stack);
+    return [];
+  }
 }
 
 // プロジェクト名を解決（#名前 or プロジェクト:名前 から project_id を返す）
 async function resolveProjectId(projectName) {
-  if (!projectName || !projectName.trim()) return null;
+  console.log(`[DEBUG ${new Date().toISOString()}] resolveProjectId: Starting for "${projectName}"`);
+  if (!projectName || !projectName.trim()) {
+    console.log(`[DEBUG ${new Date().toISOString()}] resolveProjectId: Empty project name`);
+    return null;
+  }
   const name = projectName.trim();
-  const projects = await getTodoistProjects();
-  console.log(`[DEBUG] Searching for project: "${name}"`);
-  console.log(`[DEBUG] Available projects:`, projects.map(p => p.name));
-  const match = projects.find((p) => p.name === name || p.name.includes(name) || name.includes(p.name));
-  console.log(`[DEBUG] Match found:`, match ? match.name : 'none');
-  return match ? match.id : null;
+
+  try {
+    const projects = await getTodoistProjects();
+    console.log(`[DEBUG ${new Date().toISOString()}] resolveProjectId: Searching for project: "${name}"`);
+    console.log(`[DEBUG ${new Date().toISOString()}] resolveProjectId: Available projects:`, projects.map(p => p.name));
+    const match = projects.find((p) => p.name === name || p.name.includes(name) || name.includes(p.name));
+    console.log(`[DEBUG ${new Date().toISOString()}] resolveProjectId: Match found:`, match ? match.name : 'none');
+    return match ? match.id : null;
+  } catch (error) {
+    console.error(`[ERROR ${new Date().toISOString()}] resolveProjectId: ${error.message}`);
+    return null;
+  }
 }
 
 // テキストからプロジェクト指定を抽出（#逆転転職, プロジェクト:逆転転職, P:逆転転職）
@@ -189,74 +225,103 @@ let userIdCacheAt = 0;
 const USER_ID_CACHE_MS = 10 * 60 * 1000; // 10分キャッシュ
 
 async function getUserIdByName(ownerName) {
-  if (!ownerName) return null;
+  console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Starting for "${ownerName}"`);
+  if (!ownerName) {
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Empty owner name`);
+    return null;
+  }
 
   // キャッシュをチェック
   if (userIdCache && Date.now() - userIdCacheAt < USER_ID_CACHE_MS) {
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Using cached data`);
     return userIdCache[ownerName] || null;
   }
 
   const token = process.env.TODOIST_TOKEN;
-  if (!token) return null;
+  if (!token) {
+    console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: No TODOIST_TOKEN`);
+    return null;
+  }
 
   try {
-    console.log('[DEBUG] getUserIdByName: Starting for', ownerName);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Fetching projects`);
 
     // 「winova_slack✖️todoist」プロジェクト内の「ID取得用」タスクを検索
     const projects = await getTodoistProjects();
-    console.log('[DEBUG] getUserIdByName: Got projects');
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Got ${projects.length} projects`);
 
     const targetProject = projects.find(p => p.name === 'winova_slack✖️todoist');
 
     if (!targetProject) {
-      console.warn('[WARN] winova_slack✖️todoist プロジェクトが見つかりません');
+      console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: winova_slack✖️todoist プロジェクトが見つかりません`);
+      console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Available projects:`, projects.map(p => p.name));
       return null;
     }
 
-    console.log('[DEBUG] getUserIdByName: Found target project');
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Found target project ID: ${targetProject.id}`);
 
     // プロジェクト内のタスクを取得
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Fetching tasks for project ${targetProject.id}`);
+    const controller1 = new AbortController();
+    const timeoutId1 = setTimeout(() => controller1.abort(), 8000);
+
     const tasksRes = await fetch(`https://api.todoist.com/rest/v2/tasks?project_id=${targetProject.id}`, {
-      headers: { 'Authorization': `Bearer ${token}` }
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: controller1.signal
     });
+    clearTimeout(timeoutId1);
 
-    console.log('[DEBUG] getUserIdByName: Tasks fetch status:', tasksRes.status);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Tasks fetch status: ${tasksRes.status}`);
 
-    if (!tasksRes.ok) return null;
+    if (!tasksRes.ok) {
+      console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: Tasks fetch failed with status ${tasksRes.status}`);
+      return null;
+    }
 
     const tasks = await tasksRes.json();
-    console.log('[DEBUG] getUserIdByName: Got tasks, count:', tasks.length);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Got ${tasks.length} tasks`);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Task contents:`, tasks.map(t => t.content));
 
     const idTask = tasks.find(t => t.content.includes('ID取得'));
 
     if (!idTask) {
-      console.warn('[WARN] ID取得用のタスクが見つかりません');
+      console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: ID取得用のタスクが見つかりません`);
       return null;
     }
 
-    console.log('[DEBUG] getUserIdByName: Found ID task:', idTask.id);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Found ID task: ${idTask.id} - "${idTask.content}"`);
 
     // タスクのコメントを取得
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Fetching comments for task ${idTask.id}`);
+    const controller2 = new AbortController();
+    const timeoutId2 = setTimeout(() => controller2.abort(), 8000);
+
     const commentsRes = await fetch(`https://api.todoist.com/rest/v2/comments?task_id=${idTask.id}`, {
-      headers: { 'Authorization': `Bearer ${token}` }
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal: controller2.signal
     });
+    clearTimeout(timeoutId2);
 
-    console.log('[DEBUG] getUserIdByName: Comments fetch status:', commentsRes.status);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Comments fetch status: ${commentsRes.status}`);
 
-    if (!commentsRes.ok) return null;
+    if (!commentsRes.ok) {
+      console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: Comments fetch failed with status ${commentsRes.status}`);
+      return null;
+    }
 
     const comments = await commentsRes.json();
-    console.log('[DEBUG] getUserIdByName: Got comments, count:', comments.length);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Got ${comments.length} comments`);
 
     if (comments.length === 0) {
-      console.warn('[WARN] ID取得用タスクにコメントがありません');
+      console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: ID取得用タスクにコメントがありません`);
       return null;
     }
 
     // コメントからユーザー名と ID のマッピングを作成
     const userMapping = {};
-    comments.forEach(comment => {
+    comments.forEach((comment, idx) => {
       const content = comment.content || '';
+      console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Processing comment ${idx}: "${content}"`);
       // [名前](todoist-mention://ID) の形式をパース
       const mentionRegex = /\[([^\]]+)\]\(todoist-mention:\/\/(\d+)\)/g;
       let match;
@@ -264,11 +329,13 @@ async function getUserIdByName(ownerName) {
         const name = match[1];
         const id = match[2];
         userMapping[name] = id;
+        console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Mapped "${name}" -> ${id}`);
 
         // 名前のバリエーションも登録（「谷田倖輝/koki.yata」→「谷田倖輝」）
         const simpleName = name.split('/')[0].trim();
         if (simpleName !== name) {
           userMapping[simpleName] = id;
+          console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Also mapped "${simpleName}" -> ${id}`);
         }
       }
     });
@@ -277,13 +344,14 @@ async function getUserIdByName(ownerName) {
     userIdCache = userMapping;
     userIdCacheAt = Date.now();
 
-    console.log('[DEBUG] User ID mapping:', userMapping);
-    console.log('[DEBUG] getUserIdByName: Returning ID for', ownerName, ':', userMapping[ownerName] || null);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Final user ID mapping:`, userMapping);
+    console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Returning ID for "${ownerName}": ${userMapping[ownerName] || null}`);
 
     return userMapping[ownerName] || null;
 
   } catch (error) {
-    console.error('[ERROR] Failed to fetch user IDs:', error.message);
+    console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: ${error.message}`);
+    console.error(`[ERROR ${new Date().toISOString()}] getUserIdByName: Stack:`, error.stack);
     return null;
   }
 }
@@ -291,8 +359,12 @@ async function getUserIdByName(ownerName) {
 
 // Todoist にタスクを作成
 async function createTodoistTask(content, options = {}) {
+  console.log(`[DEBUG ${new Date().toISOString()}] createTodoistTask: Starting`);
   const token = process.env.TODOIST_TOKEN;
-  if (!token) throw new Error('TODOIST_TOKEN が設定されていません');
+  if (!token) {
+    console.error(`[ERROR ${new Date().toISOString()}] createTodoistTask: TODOIST_TOKEN が設定されていません`);
+    throw new Error('TODOIST_TOKEN が設定されていません');
+  }
 
   const body = {
     content: (content && content.trim()) ? content.trim() : '（Slackから追加）',
@@ -302,23 +374,39 @@ async function createTodoistTask(content, options = {}) {
     ...(options.description && { description: options.description }),
   };
 
-  console.log('[DEBUG] Creating Todoist task with body:', JSON.stringify(body, null, 2));
+  console.log(`[DEBUG ${new Date().toISOString()}] createTodoistTask: Body:`, JSON.stringify(body, null, 2));
 
-  const res = await fetch('https://api.todoist.com/rest/v2/tasks', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Todoist API エラー: ${res.status} ${err}`);
+    const res = await fetch('https://api.todoist.com/rest/v2/tasks', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    console.log(`[DEBUG ${new Date().toISOString()}] createTodoistTask: Response status: ${res.status}`);
+
+    if (!res.ok) {
+      const err = await res.text();
+      console.error(`[ERROR ${new Date().toISOString()}] createTodoistTask: API error ${res.status}: ${err}`);
+      throw new Error(`Todoist API エラー: ${res.status} ${err}`);
+    }
+
+    const result = await res.json();
+    console.log(`[DEBUG ${new Date().toISOString()}] createTodoistTask: Success, task ID: ${result.id}`);
+    return result;
+  } catch (error) {
+    console.error(`[ERROR ${new Date().toISOString()}] createTodoistTask: ${error.message}`);
+    console.error(`[ERROR ${new Date().toISOString()}] createTodoistTask: Stack:`, error.stack);
+    throw error;
   }
-
-  return res.json();
 }
 
 // ★ スラッシュコマンドは body パース前に処理（生bodyで署名検証するため）
@@ -383,20 +471,24 @@ app.post('/slack/command', (req, res, next) => {
   }
 
   try {
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Starting task creation`);
     // プロジェクトの決定: 明示的な指定がなければ winova_slack✖️todoist を使用
     let finalProjectName = projectName;
     if (!finalProjectName) {
       finalProjectName = 'winova_slack✖️todoist';
     }
-    console.log(`[DEBUG] Using project: ${finalProjectName}`);
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Using project: ${finalProjectName}`);
 
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Resolving project ID...`);
     const projectId = finalProjectName ? await resolveProjectId(finalProjectName) : null;
-    console.log(`[DEBUG] finalProjectName: ${finalProjectName}, projectId: ${projectId}`);
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: finalProjectName: ${finalProjectName}, projectId: ${projectId}`);
 
     // 担当者の Todoist ID を動的に取得
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Getting user ID for "${ownerName}"...`);
     const assigneeId = ownerName ? await getUserIdByName(ownerName) : null;
-    console.log(`[DEBUG] ownerName: ${ownerName}, assigneeId: ${assigneeId}`);
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: ownerName: ${ownerName}, assigneeId: ${assigneeId}`);
 
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Creating Todoist task...`);
     const task = await createTodoistTask(content, {
       due_string: dueString,
       due_lang: 'ja',
@@ -406,13 +498,16 @@ app.post('/slack/command', (req, res, next) => {
       ...(!assigneeId && ownerName && { description: `担当: ${ownerName}` }),
     });
 
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Task created successfully:`, task.id);
     let msg = `✅ Todoistにタスクを追加しました: *${task.content}*\n期日: ${dueString}`;
     if (ownerName) msg += `\n担当: ${ownerName}`;
     if (finalProjectName) msg += `\nプロジェクト: ${finalProjectName}`;
     if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
     sendToSlack({ response_type: 'ephemeral', text: msg });
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Success message sent to Slack`);
   } catch (err) {
-    console.error(err);
+    console.error(`[ERROR ${new Date().toISOString()}] Main handler: ${err.message}`);
+    console.error(`[ERROR ${new Date().toISOString()}] Main handler: Stack:`, err.stack);
     sendToSlack({
       response_type: 'ephemeral',
       text: `❌ 追加に失敗しました: ${err.message}`,
@@ -424,9 +519,22 @@ app.post('/slack/command', (req, res, next) => {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ヘルスチェック（ngrokなどで動作確認用）
+// ヘルスチェック(ngrokなどで動作確認用)
 app.get('/', (req, res) => {
-  res.send('Slack-Todoist連携サーバー稼働中。POST /slack/command にスラッシュコマンドを送信してください。');
+  const status = {
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    environment: {
+      TODOIST_TOKEN: process.env.TODOIST_TOKEN ? '✅ Set' : '❌ Not set',
+      SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET ? '✅ Set' : '❌ Not set',
+    },
+    cache: {
+      projectsCache: projectsCache ? `${projectsCache.length} projects cached` : 'No cache',
+      userIdCache: userIdCache ? `${Object.keys(userIdCache).length} users cached` : 'No cache',
+    }
+  };
+
+  res.json(status);
 });
 
 app.listen(PORT, () => {
