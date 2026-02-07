@@ -146,43 +146,59 @@ let projectsCache = null;
 let projectsCacheAt = 0;
 const PROJECTS_CACHE_MS = 5 * 60 * 1000;
 
+// 同時リクエストの重複排除用プロミス
+let projectsPromise = null;
+
 async function getTodoistProjects() {
   console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Starting`);
   if (projectsCache && Date.now() - projectsCacheAt < PROJECTS_CACHE_MS) {
     console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Returning cached projects`);
     return projectsCache;
   }
+
+  // 既に取得中のリクエストがあればそれに乗る
+  if (projectsPromise) {
+    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Reusing existing promise`);
+    return projectsPromise;
+  }
+
   const token = process.env.TODOIST_TOKEN;
   if (!token) {
     console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: No TODOIST_TOKEN`);
     return [];
   }
 
-  try {
-    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Fetching from API`);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8秒タイムアウト
+  projectsPromise = (async () => {
+    try {
+      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Fetching from API`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch('https://api.todoist.com/rest/v2/projects', {
-      headers: { 'Authorization': `Bearer ${token}` },
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
+      const res = await fetch('https://api.todoist.com/rest/v2/projects', {
+        headers: { 'Authorization': `Bearer ${token}` },
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Response status ${res.status}`);
-    if (!res.ok) {
-      console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: API returned ${res.status}`);
+      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Response status ${res.status}`);
+      if (!res.ok) {
+        console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: API returned ${res.status}`);
+        return [];
+      }
+      const data = await res.json();
+      projectsCache = data;
+      projectsCacheAt = Date.now();
+      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Success, ${data.length} projects`);
+      return data;
+    } catch (error) {
+      console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: ${error.message}`);
       return [];
+    } finally {
+      projectsPromise = null;
     }
-    projectsCache = await res.json();
-    projectsCacheAt = Date.now();
-    console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Success, ${projectsCache.length} projects`);
-    return projectsCache;
-  } catch (error) {
-    console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: ${error.message}`);
-    console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: Stack:`, error.stack);
-    return [];
-  }
+  })();
+
+  return projectsPromise;
 }
 
 // プロジェクト名を解決（#名前 or プロジェクト:名前 から project_id を返す）
@@ -429,86 +445,65 @@ app.post('/slack/command', (req, res, next) => {
 
   const params = new URLSearchParams(rawBody);
   const text = params.get('text') || '';
-  const responseUrl = params.get('response_url');
-
-  // Slackは3秒以内に何か返す必要があるので、先に「処理中」で200を返す
-  res.status(200).json({
-    response_type: 'ephemeral',
-    text: 'Todoistに追加しています…',
-  });
-
-  const sendToSlack = (payload) => {
-    if (responseUrl) {
-      fetch(responseUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }).catch((e) => console.error('response_url error', e));
-    }
-  };
+  // process.env.VERCEL がある場合は同期的に処理（フリーズ回避）
+  // const responseUrl = params.get('response_url');
 
   const { content, dueString, ownerName, ownerAmbiguous, projectName } = parseTaskText(text);
-  console.log(`[DEBUG] Parsed text: "${text}"`);
-  console.log(`[DEBUG] content: "${content}", dueString: "${dueString}", ownerName: "${ownerName}", projectName: "${projectName}"`);
+  console.log(`[DEBUG ${new Date().toISOString()}] Parsed text: "${text}"`);
 
   // 期日がないとタスク化しない
   if (!dueString) {
-    sendToSlack({
+    return res.status(200).json({
       response_type: 'ephemeral',
-      text: '❌ 期日を書いてもらえないとタスク化できません。\n例: `/todoist 資料作成 明日 中村` または `/todoist レポート提出 来週金曜 浦本`',
+      text: '❌ 期日を書いてもらえないとタスク化できません。\n例: `/todoist 資料作成 明日 中村`',
     });
-    return;
   }
 
-  // 同姓が複数いる場合（例: 石原）は苗字だけだと必ず聞き返す
+  // 同姓が複数いる場合
   if (ownerAmbiguous) {
     const names = ownerAmbiguous.options.map((n) => `${n}さん`).join('と');
-    sendToSlack({
+    return res.status(200).json({
       response_type: 'ephemeral',
-      text: `❌ 「${ownerAmbiguous.familyName}」は${names}がいます。どちらに振りますか？\nフルネームで指定してください。例: \`/todoist ${content} ${dueString} ${ownerAmbiguous.options[0]}\``,
+      text: `❌ 「${ownerAmbiguous.familyName}」は${names}がいます。どちらに振りますか？\nフルネームで指定してください。`,
     });
-    return;
   }
 
   try {
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Starting task creation`);
-    // プロジェクトの決定: 明示的な指定がなければ winova_slack✖️todoist を使用
-    let finalProjectName = projectName;
-    if (!finalProjectName) {
-      finalProjectName = 'winova_slack✖️todoist';
-    }
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Using project: ${finalProjectName}`);
+    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Starting task creation (Sync Mode)`);
 
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Resolving project ID...`);
-    const projectId = finalProjectName ? await resolveProjectId(finalProjectName) : null;
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: finalProjectName: ${finalProjectName}, projectId: ${projectId}`);
+    let finalProjectName = projectName || 'winova_slack✖️todoist';
 
-    // 担当者の Todoist ID を動的に取得
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Getting user ID for "${ownerName}"...`);
-    const assigneeId = ownerName ? await getUserIdByName(ownerName) : null;
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: ownerName: ${ownerName}, assigneeId: ${assigneeId}`);
+    // 並列実行で高速化
+    const [projectId, assigneeId] = await Promise.all([
+      finalProjectName ? resolveProjectId(finalProjectName) : Promise.resolve(null),
+      ownerName ? getUserIdByName(ownerName) : Promise.resolve(null)
+    ]);
 
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Creating Todoist task...`);
+    console.log(`[DEBUG] Resolved - Project: ${projectId}, Assignee: ${assigneeId}`);
+
     const task = await createTodoistTask(content, {
       due_string: dueString,
       due_lang: 'ja',
       ...(projectId && { project_id: projectId }),
       ...(assigneeId && { assignee_id: assigneeId }),
-      // assignee_id がない場合は description にフォールバック
       ...(!assigneeId && ownerName && { description: `担当: ${ownerName}` }),
     });
 
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Task created successfully:`, task.id);
+    console.log(`[DEBUG ${new Date().toISOString()}] Task created: ${task.id}`);
+
     let msg = `✅ Todoistにタスクを追加しました: *${task.content}*\n期日: ${dueString}`;
     if (ownerName) msg += `\n担当: ${ownerName}`;
     if (finalProjectName) msg += `\nプロジェクト: ${finalProjectName}`;
     if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
-    sendToSlack({ response_type: 'ephemeral', text: msg });
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Success message sent to Slack`);
+
+    // レスポンスを返して終了（ここでVercelがフリーズしてもOK）
+    res.status(200).json({
+      response_type: 'ephemeral',
+      text: msg
+    });
   } catch (err) {
-    console.error(`[ERROR ${new Date().toISOString()}] Main handler: ${err.message}`);
-    console.error(`[ERROR ${new Date().toISOString()}] Main handler: Stack:`, err.stack);
-    sendToSlack({
+    console.error(`[ERROR] ${err.message}`);
+    res.status(200).json({
       response_type: 'ephemeral',
       text: `❌ 追加に失敗しました: ${err.message}`,
     });
