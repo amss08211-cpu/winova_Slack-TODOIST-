@@ -174,7 +174,7 @@ async function getTodoistProjects() {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-      const res = await fetch('https://api.todoist.com/rest/v2/projects', {
+      const res = await fetch('https://api.todoist.com/api/v1/projects', {
         headers: { 'Authorization': `Bearer ${token}` },
         signal: controller.signal
       });
@@ -281,7 +281,7 @@ async function getUserIdByName(ownerName) {
     const controller1 = new AbortController();
     const timeoutId1 = setTimeout(() => controller1.abort(), 8000);
 
-    const tasksRes = await fetch(`https://api.todoist.com/rest/v2/tasks?project_id=${targetProject.id}`, {
+    const tasksRes = await fetch(`https://api.todoist.com/api/v1/tasks?project_id=${targetProject.id}`, {
       headers: { 'Authorization': `Bearer ${token}` },
       signal: controller1.signal
     });
@@ -312,7 +312,7 @@ async function getUserIdByName(ownerName) {
     const controller2 = new AbortController();
     const timeoutId2 = setTimeout(() => controller2.abort(), 8000);
 
-    const commentsRes = await fetch(`https://api.todoist.com/rest/v2/comments?task_id=${idTask.id}`, {
+    const commentsRes = await fetch(`https://api.todoist.com/api/v1/comments?task_id=${idTask.id}`, {
       headers: { 'Authorization': `Bearer ${token}` },
       signal: controller2.signal
     });
@@ -396,7 +396,7 @@ async function createTodoistTask(content, options = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    const res = await fetch('https://api.todoist.com/rest/v2/tasks', {
+    const res = await fetch('https://api.todoist.com/api/v1/tasks', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
