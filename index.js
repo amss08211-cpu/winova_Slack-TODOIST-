@@ -186,10 +186,13 @@ async function getTodoistProjects() {
         return [];
       }
       const data = await res.json();
-      projectsCache = data;
+      // API v1 は { results: [...] } 形式の可能性があるため対応
+      const projects = Array.isArray(data) ? data : (data.results || data.projects || []);
+      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Response type: ${Array.isArray(data) ? 'array' : 'object'}`);
+      projectsCache = projects;
       projectsCacheAt = Date.now();
-      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Success, ${data.length} projects`);
-      return data;
+      console.log(`[DEBUG ${new Date().toISOString()}] getTodoistProjects: Success, ${projects.length} projects`);
+      return projects;
     } catch (error) {
       console.error(`[ERROR ${new Date().toISOString()}] getTodoistProjects: ${error.message}`);
       return [];
@@ -294,7 +297,9 @@ async function getUserIdByName(ownerName) {
       return null;
     }
 
-    const tasks = await tasksRes.json();
+    const tasksData = await tasksRes.json();
+    // API v1 は { results: [...] } 形式の可能性があるため対応
+    const tasks = Array.isArray(tasksData) ? tasksData : (tasksData.results || tasksData.items || []);
     console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Got ${tasks.length} tasks`);
     console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Task contents:`, tasks.map(t => t.content));
 
@@ -325,7 +330,9 @@ async function getUserIdByName(ownerName) {
       return null;
     }
 
-    const comments = await commentsRes.json();
+    const commentsData = await commentsRes.json();
+    // API v1 は { results: [...] } 形式の可能性があるため対応
+    const comments = Array.isArray(commentsData) ? commentsData : (commentsData.results || commentsData.items || []);
     console.log(`[DEBUG ${new Date().toISOString()}] getUserIdByName: Got ${comments.length} comments`);
 
     if (comments.length === 0) {
