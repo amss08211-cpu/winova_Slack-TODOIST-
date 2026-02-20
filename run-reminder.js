@@ -27,7 +27,7 @@ function getOverdueTasks() {
   url.searchParams.set('filter', 'overdue');
   return fetch(url.toString(), {
     headers: { 'Authorization': `Bearer ${TODOIST_TOKEN}` },
-  }).then((res) => {
+  }).then(async (res) => {
     if (!res.ok) throw new Error(`Todoist: ${res.status} ${await res.text()}`);
     return res.json();
   });

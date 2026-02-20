@@ -4,6 +4,10 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
+// lib モジュール
+const { openTaskModal, updateModalSections, postMessage } = require('./lib/slack');
+const { getTodoistProjects, getSections, createTodoistTask, resolveProjectId, resolveSectionId } = require('./lib/todoist');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -451,68 +455,33 @@ app.post('/slack/command', (req, res, next) => {
   }
 
   const params = new URLSearchParams(rawBody);
-  const text = params.get('text') || '';
-  // process.env.VERCEL がある場合は同期的に処理（フリーズ回避）
-  // const responseUrl = params.get('response_url');
+  const triggerId = params.get('trigger_id');
+  const botToken = process.env.SLACK_BOT_TOKEN;
 
-  const { content, dueString, ownerName, ownerAmbiguous, projectName } = parseTaskText(text);
-  console.log(`[DEBUG ${new Date().toISOString()}] Parsed text: "${text}"`);
-
-  // 期日がないとタスク化しない
-  if (!dueString) {
+  // Modal を開く
+  if (!botToken) {
     return res.status(200).json({
       response_type: 'ephemeral',
-      text: '❌ 期日を書いてもらえないとタスク化できません。\n例: `/todoist 資料作成 明日 中村`',
+      text: '❌ SLACK_BOT_TOKEN が設定されていません。管理者に連絡してください。',
     });
   }
 
-  // 同姓が複数いる場合
-  if (ownerAmbiguous) {
-    const names = ownerAmbiguous.options.map((n) => `${n}さん`).join('と');
+  if (!triggerId) {
     return res.status(200).json({
       response_type: 'ephemeral',
-      text: `❌ 「${ownerAmbiguous.familyName}」は${names}がいます。どちらに振りますか？\nフルネームで指定してください。`,
+      text: '❌ trigger_id が取得できませんでした。',
     });
   }
 
   try {
-    console.log(`[DEBUG ${new Date().toISOString()}] Main handler: Starting task creation (Sync Mode)`);
-
-    let finalProjectName = projectName || 'winova_slack✖️todoist';
-
-    // 並列実行で高速化
-    const [projectId, assigneeId] = await Promise.all([
-      finalProjectName ? resolveProjectId(finalProjectName) : Promise.resolve(null),
-      ownerName ? getUserIdByName(ownerName) : Promise.resolve(null)
-    ]);
-
-    console.log(`[DEBUG] Resolved - Project: ${projectId}, Assignee: ${assigneeId}`);
-
-    const task = await createTodoistTask(content, {
-      due_string: dueString,
-      due_lang: 'ja',
-      ...(projectId && { project_id: projectId }),
-      ...(assigneeId && { assignee_id: assigneeId }),
-      ...(!assigneeId && ownerName && { description: `担当: ${ownerName}` }),
-    });
-
-    console.log(`[DEBUG ${new Date().toISOString()}] Task created: ${task.id}`);
-
-    let msg = `✅ Todoistにタスクを追加しました: *${task.content}*\n期日: ${dueString}`;
-    if (ownerName) msg += `\n担当: ${ownerName}`;
-    if (finalProjectName) msg += `\nプロジェクト: ${finalProjectName}`;
-    if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
-
-    // レスポンスを返して終了（ここでVercelがフリーズしてもOK）
-    res.status(200).json({
-      response_type: 'in_channel',
-      text: msg
-    });
+    await openTaskModal(triggerId, botToken);
+    // Modal を開いたら即座に 200 を返す（空レスポンス）
+    return res.status(200).send('');
   } catch (err) {
-    console.error(`[ERROR] ${err.message}`);
-    res.status(200).json({
+    console.error(`[ERROR] Failed to open modal: ${err.message}`);
+    return res.status(200).json({
       response_type: 'ephemeral',
-      text: `❌ 追加に失敗しました: ${err.message}`,
+      text: `❌ Modalを開けませんでした: ${err.message}`,
     });
   }
 });
@@ -520,6 +489,92 @@ app.post('/slack/command', (req, res, next) => {
 // その他のルート用
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// /slack/interactivity - Modal操作を処理
+app.post('/slack/interactivity', async (req, res) => {
+  try {
+    const payload = JSON.parse(req.body.payload);
+    const botToken = process.env.SLACK_BOT_TOKEN;
+
+    console.log(`[DEBUG] Interactivity type: ${payload.type}`);
+
+    // プロジェクト選択時 → セクション一覧を更新
+    if (payload.type === 'block_actions') {
+      const action = payload.actions?.[0];
+      if (action?.action_id === 'project_select') {
+        const projectId = action.selected_option?.value;
+        console.log(`[DEBUG] Project selected: ${projectId}`);
+
+        if (projectId && botToken) {
+          await updateModalSections(
+            payload.view.id,
+            projectId,
+            botToken,
+            payload.view
+          );
+        }
+      }
+      return res.status(200).send('');
+    }
+
+    // Modal送信時 → タスク作成
+    if (payload.type === 'view_submission' && payload.view?.callback_id === 'task_create_modal') {
+      const values = payload.view.state.values;
+
+      const content = values.task_content?.content_input?.value;
+      const dueString = values.task_due?.due_input?.value || null;
+      const projectId = values.task_project?.project_select?.selected_option?.value;
+      const sectionId = values.task_section?.section_select?.selected_option?.value;
+      const assignee = values.task_assignee?.assignee_input?.value || null;
+
+      console.log(`[DEBUG] Creating task: ${content}, project: ${projectId}, section: ${sectionId}`);
+
+      if (!content) {
+        return res.status(200).json({
+          response_action: 'errors',
+          errors: { task_content: 'タスク内容を入力してください' }
+        });
+      }
+
+      // バックグラウンドでタスク作成
+      (async () => {
+        try {
+          const taskOptions = {
+            ...(dueString && { due_string: dueString, due_lang: 'ja' }),
+            ...(projectId && { project_id: projectId }),
+            ...(sectionId && sectionId !== 'none' && { section_id: sectionId }),
+            ...(assignee && { description: `担当: ${assignee}` })
+          };
+
+          const task = await createTodoistTask(content, taskOptions);
+
+          // 結果を通知（DMまたはチャンネル）
+          if (botToken && payload.user?.id) {
+            let msg = `✅ Todoistにタスクを追加しました: *${task.content}*`;
+            if (dueString) msg += `\n期日: ${dueString}`;
+            if (assignee) msg += `\n担当: ${assignee}`;
+            if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
+
+            await postMessage(payload.user.id, msg, botToken);
+          }
+        } catch (err) {
+          console.error(`[ERROR] Task creation failed: ${err.message}`);
+          if (botToken && payload.user?.id) {
+            await postMessage(payload.user.id, `❌ タスク作成に失敗しました: ${err.message}`, botToken);
+          }
+        }
+      })();
+
+      // Modalを閉じる
+      return res.status(200).json({ response_action: 'clear' });
+    }
+
+    res.status(200).send('');
+  } catch (error) {
+    console.error(`[ERROR] /slack/interactivity: ${error.message}`);
+    res.status(200).send('');
+  }
+});
 
 // ヘルスチェック(ngrokなどで動作確認用)
 app.get('/', (req, res) => {
