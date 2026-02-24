@@ -5,8 +5,8 @@ const path = require('path');
 const fs = require('fs');
 
 // lib モジュール
-const { openTaskModal, updateModalSections, postMessage } = require('./lib/slack');
-const { getTodoistProjects, getSections, createTodoistTask, resolveProjectId, resolveSectionId } = require('./lib/todoist');
+const { openTaskModal, postMessage } = require('./lib/slack');
+const { getTodoistProjects, getSections, createTodoistTask } = require('./lib/todoist');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -215,25 +215,116 @@ app.use(express.urlencoded({ extended: true }));
 // /slack/interactivity - Modal操作を処理
 app.post('/slack/interactivity', async (req, res) => {
   try {
+    if (!req.body?.payload) {
+      console.error(`[ERROR] No payload in request body`);
+      return res.status(200).send('');
+    }
     const payload = JSON.parse(req.body.payload);
     const botToken = process.env.SLACK_BOT_TOKEN;
 
-    console.log(`[DEBUG] Interactivity type: ${payload.type}`);
+    // external_select の候補を返す
+    if (payload.type === 'block_suggestion') {
+      const actionId = payload.action_id;
+      const query = (payload.value || '').trim();
+      const queryLower = query.toLowerCase();
 
-    // プロジェクト選択時 → セクション一覧を更新
+      // プロジェクト候補
+      if (actionId === 'project_select') {
+        const projects = await getTodoistProjects();
+
+        // アーカイブ・削除済み・オンボーディング・インボックス・不要プロジェクトを除外
+        const excludeNames = ['はじめよう', 'インボックス','てすと用３', 'テスト用３'];
+        const activeProjects = projects.filter(p =>
+          !p.is_archived &&
+          !p.is_deleted &&
+          !p.is_inbox_project &&
+          !excludeNames.some(name => p.name.includes(name))
+        );
+        const sortedProjects = [...activeProjects].sort((a, b) => {
+          if (a.folder_id !== b.folder_id) {
+            if (!a.folder_id) return 1;
+            if (!b.folder_id) return -1;
+            return String(a.folder_id).localeCompare(String(b.folder_id));
+          }
+          return (a.child_order || 0) - (b.child_order || 0);
+        });
+
+        const options = sortedProjects
+          .filter(p => !query || p.name.toLowerCase().includes(queryLower))
+          .slice(0, 100)
+          .map(p => ({
+            text: { type: 'plain_text', text: p.name },
+            value: p.id
+          }));
+
+        return res.status(200).json({ options });
+      }
+
+      // セクション候補（選択されたプロジェクトのセクションのみ表示）
+      if (actionId === 'section_select') {
+        // private_metadataから選択されたプロジェクトIDを取得
+        const metadata = payload.view?.private_metadata || '';
+        const projectIds = metadata.startsWith('projects:') ? metadata.substring(9).split(',') : [];
+
+        let options = [
+          { text: { type: 'plain_text', text: '（なし）' }, value: 'none' }
+        ];
+
+        if (projectIds.length > 0) {
+          const projects = await getTodoistProjects();
+
+          // 選択されたプロジェクトのみ処理
+          for (const projectId of projectIds) {
+            const proj = projects.find(p => p.id === projectId);
+            if (!proj) continue;
+
+            const sections = await getSections(projectId);
+            const sortedSections = [...sections].sort((a, b) => (a.section_order || a.order || 0) - (b.section_order || b.order || 0));
+            const filtered = sortedSections
+              .filter(s => !query || s.name.toLowerCase().includes(queryLower))
+              .map(s => ({
+                text: { type: 'plain_text', text: projectIds.length > 1 ? `${s.name} (${proj.name})` : s.name },
+                value: s.id
+              }));
+            options = options.concat(filtered);
+          }
+        }
+
+        return res.status(200).json({ options: options.slice(0, 100) });
+      }
+
+      return res.status(200).json({ options: [] });
+    }
+
+    // プロジェクト選択時 → private_metadataに選択されたプロジェクトIDを保存
     if (payload.type === 'block_actions') {
       const action = payload.actions?.[0];
       if (action?.action_id === 'project_select') {
-        const projectId = action.selected_option?.value;
-        console.log(`[DEBUG] Project selected: ${projectId}`);
+        const selectedOptions = action.selected_options || [];
+        const projectIds = selectedOptions.map(opt => opt.value).join(',');
 
-        if (projectId && botToken) {
-          await updateModalSections(
-            payload.view.id,
-            projectId,
-            botToken,
-            payload.view
-          );
+        // private_metadataにプロジェクトIDを保存してモーダル更新
+        if (botToken && projectIds) {
+          const newMetadata = `projects:${projectIds}`;
+          await fetch('https://slack.com/api/views.update', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${botToken}`
+            },
+            body: JSON.stringify({
+              view_id: payload.view.id,
+              view: {
+                type: 'modal',
+                callback_id: payload.view.callback_id,
+                private_metadata: newMetadata,
+                title: payload.view.title,
+                submit: payload.view.submit,
+                close: payload.view.close,
+                blocks: payload.view.blocks
+              }
+            })
+          });
         }
       }
       return res.status(200).send('');
@@ -243,13 +334,13 @@ app.post('/slack/interactivity', async (req, res) => {
     if (payload.type === 'view_submission' && payload.view?.callback_id === 'task_create_modal') {
       const values = payload.view.state.values;
 
+      const mentionUserIds = values.task_mentions?.mentions_select?.selected_users || [];
       const content = values.task_content?.content_input?.value;
+      const description = values.task_description?.description_input?.value || null;
       const dueString = values.task_due?.due_input?.value || null;
-      const projectId = values.task_project?.project_select?.selected_option?.value;
-      const sectionId = values.task_section?.section_select?.selected_option?.value;
-      const assignee = values.task_assignee?.assignee_input?.value || null;
-
-      console.log(`[DEBUG] Creating task: ${content}, project: ${projectId}, section: ${sectionId}`);
+      // 複数選択対応
+      const selectedProjects = values.task_project?.project_select?.selected_options || [];
+      const selectedSections = values.task_section?.section_select?.selected_options || [];
 
       if (!content) {
         return res.status(200).json({
@@ -258,26 +349,88 @@ app.post('/slack/interactivity', async (req, res) => {
         });
       }
 
+      if (selectedProjects.length === 0) {
+        return res.status(200).json({
+          response_action: 'errors',
+          errors: { task_project: 'プロジェクトを選択してください' }
+        });
+      }
+
       // バックグラウンドでタスク作成
       (async () => {
         try {
-          const taskOptions = {
-            ...(dueString && { due_string: dueString, due_lang: 'ja' }),
-            ...(projectId && { project_id: projectId }),
-            ...(sectionId && sectionId !== 'none' && { section_id: sectionId }),
-            ...(assignee && { description: `担当: ${assignee}` })
-          };
+          const projects = await getTodoistProjects();
+          const createdTasks = [];
 
-          const task = await createTodoistTask(content, taskOptions);
+          // 選択されたセクションを取得（noneを除外）
+          const validSections = selectedSections.filter(s => s.value !== 'none');
 
-          // 結果を通知（DMまたはチャンネル）
-          if (botToken && payload.user?.id) {
-            let msg = `✅ Todoistにタスクを追加しました: *${task.content}*`;
-            if (dueString) msg += `\n期日: ${dueString}`;
-            if (assignee) msg += `\n担当: ${assignee}`;
-            if (task.url) msg += `\n<${task.url}|Todoistで開く>`;
+          // 各プロジェクトにタスクを作成
+          for (const projOption of selectedProjects) {
+            const projectId = projOption.value;
+            const proj = projects.find(p => p.id === projectId);
+            const projectName = proj?.name || '';
 
-            await postMessage(payload.user.id, msg, botToken);
+            // このプロジェクトのセクション一覧を取得
+            const projectSections = await getSections(projectId);
+
+            // 選択されたセクションのうち、このプロジェクトに属するものをフィルタ
+            const sectionsForProject = validSections.filter(selSec =>
+              projectSections.some(ps => ps.id === selSec.value)
+            );
+
+            if (sectionsForProject.length > 0) {
+              // このプロジェクトに属するセクションごとにタスクを作成
+              for (const secOption of sectionsForProject) {
+                const sectionId = secOption.value;
+                const sec = projectSections.find(s => s.id === sectionId);
+                const sectionName = sec?.name || '';
+
+                const taskOptions = {
+                  ...(dueString && { due_string: dueString, due_lang: 'ja' }),
+                  project_id: projectId,
+                  section_id: sectionId,
+                  ...(description && { description: description })
+                };
+
+                const task = await createTodoistTask(content, taskOptions);
+                createdTasks.push({ task, projectName, sectionName });
+              }
+            } else {
+              // セクションなしでタスクを作成
+              const taskOptions = {
+                ...(dueString && { due_string: dueString, due_lang: 'ja' }),
+                project_id: projectId,
+                ...(description && { description: description })
+              };
+
+              const task = await createTodoistTask(content, taskOptions);
+              createdTasks.push({ task, projectName, sectionName: '' });
+            }
+          }
+
+          // 結果を通知（指定チャンネルまたはDM）
+          const notifyChannel = process.env.SLACK_NOTIFICATION_CHANNEL || payload.user?.id;
+          if (botToken && notifyChannel) {
+            const mentions = mentionUserIds.map(id => `<@${id}>`).join(' ');
+
+            let msg = `📍 <@${payload.user.id}> がTodoistにタスクを追加しました\n`;
+            if (mentions) msg += `To: ${mentions}\n`;
+            msg += `Task: *${content}*\n`;
+            if (dueString) msg += `期日: ${dueString}\n`;
+            if (description) msg += `説明: ${description}\n\n`;
+
+            // 各タスクの情報とURLを表示
+            for (const { task, projectName, sectionName } of createdTasks) {
+              let hierarchy = projectName;
+              if (sectionName) {
+                hierarchy += ` > ${sectionName}`;
+              }
+              const taskUrl = task.url || `https://app.todoist.com/app/task/${task.id}`;
+              msg += `🗂️ ${hierarchy} - <${taskUrl}|開く>\n`;
+            }
+
+            await postMessage(notifyChannel, msg, botToken);
           }
         } catch (err) {
           console.error(`[ERROR] Task creation failed: ${err.message}`);
