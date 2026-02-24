@@ -356,89 +356,87 @@ app.post('/slack/interactivity', async (req, res) => {
         });
       }
 
-      // バックグラウンドでタスク作成
-      (async () => {
-        try {
-          const projects = await getTodoistProjects();
-          const createdTasks = [];
+      // タスク作成（同期処理 - Vercel対応）
+      try {
+        const projects = await getTodoistProjects();
+        const createdTasks = [];
 
-          // 選択されたセクションを取得（noneを除外）
-          const validSections = selectedSections.filter(s => s.value !== 'none');
+        // 選択されたセクションを取得（noneを除外）
+        const validSections = selectedSections.filter(s => s.value !== 'none');
 
-          // 各プロジェクトにタスクを作成
-          for (const projOption of selectedProjects) {
-            const projectId = projOption.value;
-            const proj = projects.find(p => p.id === projectId);
-            const projectName = proj?.name || '';
+        // 各プロジェクトにタスクを作成
+        for (const projOption of selectedProjects) {
+          const projectId = projOption.value;
+          const proj = projects.find(p => p.id === projectId);
+          const projectName = proj?.name || '';
 
-            // このプロジェクトのセクション一覧を取得
-            const projectSections = await getSections(projectId);
+          // このプロジェクトのセクション一覧を取得
+          const projectSections = await getSections(projectId);
 
-            // 選択されたセクションのうち、このプロジェクトに属するものをフィルタ
-            const sectionsForProject = validSections.filter(selSec =>
-              projectSections.some(ps => ps.id === selSec.value)
-            );
+          // 選択されたセクションのうち、このプロジェクトに属するものをフィルタ
+          const sectionsForProject = validSections.filter(selSec =>
+            projectSections.some(ps => ps.id === selSec.value)
+          );
 
-            if (sectionsForProject.length > 0) {
-              // このプロジェクトに属するセクションごとにタスクを作成
-              for (const secOption of sectionsForProject) {
-                const sectionId = secOption.value;
-                const sec = projectSections.find(s => s.id === sectionId);
-                const sectionName = sec?.name || '';
+          if (sectionsForProject.length > 0) {
+            // このプロジェクトに属するセクションごとにタスクを作成
+            for (const secOption of sectionsForProject) {
+              const sectionId = secOption.value;
+              const sec = projectSections.find(s => s.id === sectionId);
+              const sectionName = sec?.name || '';
 
-                const taskOptions = {
-                  ...(dueString && { due_string: dueString, due_lang: 'ja' }),
-                  project_id: projectId,
-                  section_id: sectionId,
-                  ...(description && { description: description })
-                };
-
-                const task = await createTodoistTask(content, taskOptions);
-                createdTasks.push({ task, projectName, sectionName });
-              }
-            } else {
-              // セクションなしでタスクを作成
               const taskOptions = {
                 ...(dueString && { due_string: dueString, due_lang: 'ja' }),
                 project_id: projectId,
+                section_id: sectionId,
                 ...(description && { description: description })
               };
 
               const task = await createTodoistTask(content, taskOptions);
-              createdTasks.push({ task, projectName, sectionName: '' });
+              createdTasks.push({ task, projectName, sectionName });
             }
-          }
+          } else {
+            // セクションなしでタスクを作成
+            const taskOptions = {
+              ...(dueString && { due_string: dueString, due_lang: 'ja' }),
+              project_id: projectId,
+              ...(description && { description: description })
+            };
 
-          // 結果を通知（指定チャンネルまたはDM）
-          const notifyChannel = process.env.SLACK_NOTIFICATION_CHANNEL || payload.user?.id;
-          if (botToken && notifyChannel) {
-            const mentions = mentionUserIds.map(id => `<@${id}>`).join(' ');
-
-            let msg = `📍 <@${payload.user.id}> がTodoistにタスクを追加しました\n`;
-            if (mentions) msg += `To: ${mentions}\n`;
-            msg += `Task: *${content}*\n`;
-            if (dueString) msg += `期日: ${dueString}\n`;
-            if (description) msg += `説明: ${description}\n\n`;
-
-            // 各タスクの情報とURLを表示
-            for (const { task, projectName, sectionName } of createdTasks) {
-              let hierarchy = projectName;
-              if (sectionName) {
-                hierarchy += ` > ${sectionName}`;
-              }
-              const taskUrl = task.url || `https://app.todoist.com/app/task/${task.id}`;
-              msg += `🗂️ ${hierarchy} - <${taskUrl}|開く>\n`;
-            }
-
-            await postMessage(notifyChannel, msg, botToken);
-          }
-        } catch (err) {
-          console.error(`[ERROR] Task creation failed: ${err.message}`);
-          if (botToken && payload.user?.id) {
-            await postMessage(payload.user.id, `❌ タスク作成に失敗しました: ${err.message}`, botToken);
+            const task = await createTodoistTask(content, taskOptions);
+            createdTasks.push({ task, projectName, sectionName: '' });
           }
         }
-      })();
+
+        // 結果を通知（指定チャンネルまたはDM）
+        const notifyChannel = process.env.SLACK_NOTIFICATION_CHANNEL || payload.user?.id;
+        if (botToken && notifyChannel) {
+          const mentions = mentionUserIds.map(id => `<@${id}>`).join(' ');
+
+          let msg = `📍 <@${payload.user.id}> がTodoistにタスクを追加しました\n`;
+          if (mentions) msg += `To: ${mentions}\n`;
+          msg += `Task: *${content}*\n`;
+          if (dueString) msg += `期日: ${dueString}\n`;
+          if (description) msg += `説明: ${description}\n\n`;
+
+          // 各タスクの情報とURLを表示
+          for (const { task, projectName, sectionName } of createdTasks) {
+            let hierarchy = projectName;
+            if (sectionName) {
+              hierarchy += ` > ${sectionName}`;
+            }
+            const taskUrl = task.url || `https://app.todoist.com/app/task/${task.id}`;
+            msg += `🗂️ ${hierarchy} - <${taskUrl}|開く>\n`;
+          }
+
+          await postMessage(notifyChannel, msg, botToken);
+        }
+      } catch (err) {
+        console.error(`[ERROR] Task creation failed: ${err.message}`);
+        if (botToken && payload.user?.id) {
+          await postMessage(payload.user.id, `❌ タスク作成に失敗しました: ${err.message}`, botToken);
+        }
+      }
 
       // Modalを閉じる
       return res.status(200).json({ response_action: 'clear' });
