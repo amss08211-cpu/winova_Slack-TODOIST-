@@ -5,8 +5,9 @@ const path = require('path');
 const fs = require('fs');
 
 // lib モジュール
-const { openTaskModal, postMessage } = require('./lib/slack');
-const { getTodoistProjects, getSections, createTodoistTask } = require('./lib/todoist');
+const { openTaskModal, postMessage, getThreadMessages, formatThreadContent } = require('./lib/slack');
+const { getTodoistProjects, getSections, createTodoistTask, updateTodoistTask, resolveProjectId, resolveSectionId } = require('./lib/todoist');
+const { parseTaskWithAI } = require('./lib/ai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -263,8 +264,17 @@ app.post('/slack/interactivity', async (req, res) => {
       // セクション候補（選択されたプロジェクトのセクションのみ表示）
       if (actionId === 'section_select') {
         // private_metadataから選択されたプロジェクトIDを取得
-        const metadata = payload.view?.private_metadata || '';
-        const projectIds = metadata.startsWith('projects:') ? metadata.substring(9).split(',') : [];
+        let projectIds = [];
+        if (payload.view?.private_metadata) {
+          try {
+            const meta = JSON.parse(payload.view.private_metadata);
+            projectIds = meta.projects ? meta.projects.split(',') : [];
+          } catch {
+            // 旧形式の場合
+            const metadata = payload.view.private_metadata;
+            projectIds = metadata.startsWith('projects:') ? metadata.substring(9).split(',') : [];
+          }
+        }
 
         let options = [
           { text: { type: 'plain_text', text: '（なし）' }, value: 'none' }
@@ -299,13 +309,71 @@ app.post('/slack/interactivity', async (req, res) => {
     // プロジェクト選択時 → private_metadataに選択されたプロジェクトIDを保存
     if (payload.type === 'block_actions') {
       const action = payload.actions?.[0];
-      if (action?.action_id === 'project_select') {
-        const selectedOptions = action.selected_options || [];
-        const projectIds = selectedOptions.map(opt => opt.value).join(',');
 
-        // private_metadataにプロジェクトIDを保存してモーダル更新
-        if (botToken && projectIds) {
-          const newMetadata = `projects:${projectIds}`;
+      // AI要約ボタンクリック時
+      if (action?.action_id === 'ai_summarize') {
+        const values = payload.view.state.values;
+        const sourceText = values.ai_source?.ai_source_input?.value || '';
+
+        if (!sourceText.trim()) {
+          // 要約元テキストが空の場合は何もしない
+          return res.status(200).send('');
+        }
+
+        try {
+          // AIで要約
+          const taskInfo = await parseTaskWithAI(sourceText);
+
+          // 現在のブロックをコピーして、値を更新
+          const updatedBlocks = payload.view.blocks.map(block => {
+            if (block.block_id === 'task_content') {
+              return {
+                ...block,
+                element: {
+                  ...block.element,
+                  initial_value: taskInfo.title || ''
+                }
+              };
+            }
+            if (block.block_id === 'task_description') {
+              return {
+                ...block,
+                element: {
+                  ...block.element,
+                  initial_value: taskInfo.description || ''
+                }
+              };
+            }
+            if (block.block_id === 'task_due') {
+              return {
+                ...block,
+                element: {
+                  ...block.element,
+                  initial_value: taskInfo.due_date || ''
+                }
+              };
+            }
+            return block;
+          });
+
+          // 既存のmetadataをパースして、AI結果を追加
+          let metadata = {};
+          if (payload.view.private_metadata) {
+            try {
+              metadata = JSON.parse(payload.view.private_metadata);
+            } catch {
+              // 旧形式（projects:xxx）の場合
+              if (payload.view.private_metadata.startsWith('projects:')) {
+                metadata = { projects: payload.view.private_metadata.substring(9) };
+              }
+            }
+          }
+          metadata.ai_title = taskInfo.title || '';
+          metadata.ai_description = taskInfo.description || '';
+          metadata.ai_due = taskInfo.due_date || '';
+          metadata.ai_source = sourceText; // 元テキストを保存
+
+          // モーダルを更新
           await fetch('https://slack.com/api/views.update', {
             method: 'POST',
             headers: {
@@ -317,7 +385,50 @@ app.post('/slack/interactivity', async (req, res) => {
               view: {
                 type: 'modal',
                 callback_id: payload.view.callback_id,
-                private_metadata: newMetadata,
+                private_metadata: JSON.stringify(metadata),
+                title: payload.view.title,
+                submit: payload.view.submit,
+                close: payload.view.close,
+                blocks: updatedBlocks
+              }
+            })
+          });
+        } catch (err) {
+          console.error(`[ERROR] AI要約エラー: ${err.message}`);
+        }
+
+        return res.status(200).send('');
+      }
+
+      if (action?.action_id === 'project_select') {
+        const selectedOptions = action.selected_options || [];
+        const projectIds = selectedOptions.map(opt => opt.value).join(',');
+
+        // private_metadataにプロジェクトIDを保存してモーダル更新
+        if (botToken) {
+          // 既存のmetadataを保持しつつprojectsを更新
+          let metadata = {};
+          if (payload.view.private_metadata) {
+            try {
+              metadata = JSON.parse(payload.view.private_metadata);
+            } catch {
+              // 旧形式の場合は無視
+            }
+          }
+          metadata.projects = projectIds;
+
+          await fetch('https://slack.com/api/views.update', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${botToken}`
+            },
+            body: JSON.stringify({
+              view_id: payload.view.id,
+              view: {
+                type: 'modal',
+                callback_id: payload.view.callback_id,
+                private_metadata: JSON.stringify(metadata),
                 title: payload.view.title,
                 submit: payload.view.submit,
                 close: payload.view.close,
@@ -334,10 +445,24 @@ app.post('/slack/interactivity', async (req, res) => {
     if (payload.type === 'view_submission' && payload.view?.callback_id === 'task_create_modal') {
       const values = payload.view.state.values;
 
+      // private_metadataからAI要約結果を取得（フォールバック用）
+      let metadata = {};
+      if (payload.view.private_metadata) {
+        try {
+          metadata = JSON.parse(payload.view.private_metadata);
+        } catch {
+          // 旧形式の場合
+          if (payload.view.private_metadata.startsWith('projects:')) {
+            metadata = { projects: payload.view.private_metadata.substring(9) };
+          }
+        }
+      }
+
       const mentionUserIds = values.task_mentions?.mentions_select?.selected_users || [];
-      const content = values.task_content?.content_input?.value;
-      const description = values.task_description?.description_input?.value || null;
-      const dueString = values.task_due?.due_input?.value || null;
+      // フォーム値がなければAI要約値を使用
+      const content = values.task_content?.content_input?.value || metadata.ai_title || '';
+      const description = values.task_description?.description_input?.value || metadata.ai_description || null;
+      const dueString = values.task_due?.due_input?.value || metadata.ai_due || null;
       // 複数選択対応
       const selectedProjects = values.task_project?.project_select?.selected_options || [];
       const selectedSections = values.task_section?.section_select?.selected_options || [];
@@ -408,6 +533,7 @@ app.post('/slack/interactivity', async (req, res) => {
           }
         }
 
+
         // 結果を通知（指定チャンネルまたはDM）
         const notifyChannel = process.env.SLACK_NOTIFICATION_CHANNEL || payload.user?.id;
         if (botToken && notifyChannel) {
@@ -449,6 +575,136 @@ app.post('/slack/interactivity', async (req, res) => {
   }
 });
 
+// /api/slack/events - Slackイベント（app_mention）を処理
+app.post('/api/slack/events', async (req, res) => {
+  console.log('[DEBUG] /api/slack/events リクエスト受信');
+  console.log('[DEBUG] body:', JSON.stringify(req.body, null, 2));
+
+  try {
+    const body = req.body;
+
+    // URL検証（Slack App設定時に必要）
+    if (body.type === 'url_verification') {
+      console.log('[DEBUG] URL検証リクエスト');
+      return res.status(200).json({ challenge: body.challenge });
+    }
+
+    // イベント処理
+    if (body.type === 'event_callback') {
+      const event = body.event;
+
+      // app_mention イベント（@todoist_ai でメンションされた時）
+      if (event.type === 'app_mention') {
+        console.log('[DEBUG] app_mention イベント受信:', JSON.stringify(event, null, 2));
+
+        // 即座に200を返す（3秒ルール対応）
+        res.status(200).send('');
+
+        // 以降は非同期で処理
+        const botToken = process.env.SLACK_BOT_TOKEN;
+        const channel = event.channel;
+        const threadTs = event.thread_ts || event.ts;
+        const userTs = event.ts;
+        const mentionText = event.text || '';
+
+        console.log('[DEBUG] channel:', channel, 'threadTs:', threadTs, 'userTs:', userTs);
+        console.log('[DEBUG] mentionText:', mentionText);
+
+        try {
+          // メンションテキストからプロジェクト指定を抽出（#プロジェクト名）
+          const projectMatch = mentionText.match(/#([^\s#]+)/);
+          const specifiedProjectName = projectMatch ? projectMatch[1] : null;
+          console.log('[DEBUG] specifiedProjectName:', specifiedProjectName);
+
+          // スレッドのメッセージを取得
+          const messages = await getThreadMessages(channel, threadTs, botToken);
+          console.log('[DEBUG] messages count:', messages.length);
+
+          if (messages.length === 0) {
+            await postMessage(channel, '❌ スレッドの内容を取得できませんでした', botToken, userTs);
+            return;
+          }
+
+          // スレッド内容をテキストに整形（ボットのメッセージを除外）
+          const botUserId = body.authorizations?.[0]?.user_id;
+          console.log('[DEBUG] botUserId:', botUserId);
+          const threadContent = formatThreadContent(messages, botUserId);
+          console.log('[DEBUG] threadContent:', threadContent);
+
+          if (!threadContent) {
+            await postMessage(channel, '❌ スレッドにタスク化できる内容がありませんでした', botToken, userTs);
+            return;
+          }
+
+          // AIでタスク情報を解析
+          console.log('[DEBUG] AI解析開始...');
+          const taskInfo = await parseTaskWithAI(threadContent);
+          console.log('[DEBUG] AI解析結果:', JSON.stringify(taskInfo, null, 2));
+
+          if (!taskInfo.title) {
+            await postMessage(channel, '❌ タスク情報を解析できませんでした', botToken, userTs);
+            return;
+          }
+
+          // プロジェクトIDを解決
+          let projectId = null;
+          let projectName = null;
+          if (specifiedProjectName) {
+            console.log('[DEBUG] プロジェクト解決中:', specifiedProjectName);
+            projectId = await resolveProjectId(specifiedProjectName);
+            console.log('[DEBUG] 解決されたprojectId:', projectId);
+            if (projectId) {
+              const projects = await getTodoistProjects();
+              const proj = projects.find(p => p.id === projectId);
+              projectName = proj?.name || specifiedProjectName;
+            }
+          }
+
+          // Todoistにタスクを作成
+          const taskOptions = {
+            ...(taskInfo.description && { description: taskInfo.description }),
+            ...(taskInfo.due_date && { due_date: taskInfo.due_date }),
+            ...(projectId && { project_id: projectId })
+          };
+          console.log('[DEBUG] タスク作成オプション:', JSON.stringify(taskOptions, null, 2));
+
+          const task = await createTodoistTask(taskInfo.title, taskOptions);
+          console.log('[DEBUG] 作成されたタスク:', JSON.stringify(task, null, 2));
+          const taskUrl = task.url || `https://app.todoist.com/app/task/${task.id}`;
+          console.log('[DEBUG] タスクURL:', taskUrl);
+
+          // 結果をスレッドに返信
+          let msg = `✅ Todoistにタスクを作成しました\n`;
+          msg += `📝 *${taskInfo.title}*\n`;
+          if (projectName) msg += `🗂️ ${projectName}\n`;
+          if (taskInfo.priority) msg += `優先度: ${taskInfo.priority}\n`;
+          if (taskInfo.due_date) msg += `期日: ${taskInfo.due_date}\n`;
+          msg += `\n<${taskUrl}|Todoistで開く>`;
+
+          // プロジェクト指定があったのにマッチしなかった場合は警告
+          if (specifiedProjectName && !projectId) {
+            msg += `\n\n⚠️ プロジェクト「${specifiedProjectName}」が見つからなかったため、Inboxに作成しました`;
+          }
+
+          await postMessage(channel, msg, botToken, userTs);
+
+        } catch (err) {
+          console.error(`[ERROR] app_mention処理エラー: ${err.message}`);
+          await postMessage(channel, `❌ タスク作成に失敗しました: ${err.message}`, botToken, userTs);
+        }
+
+        return;
+      }
+    }
+
+    // その他のイベントは無視
+    res.status(200).send('');
+  } catch (error) {
+    console.error(`[ERROR] /api/slack/events: ${error.message}`);
+    res.status(200).send('');
+  }
+});
+
 // ヘルスチェック(ngrokなどで動作確認用)
 app.get('/', (req, res) => {
   const status = {
@@ -458,6 +714,7 @@ app.get('/', (req, res) => {
       TODOIST_TOKEN: process.env.TODOIST_TOKEN ? '✅ Set' : '❌ Not set',
       SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET ? '✅ Set' : '❌ Not set',
       SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN ? '✅ Set' : '❌ Not set',
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY ? '✅ Set' : '❌ Not set',
     }
   };
 
