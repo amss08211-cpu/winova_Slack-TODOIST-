@@ -8,6 +8,11 @@ const fs = require('fs');
 const { openTaskModal, postMessage, getThreadMessages, formatThreadContent } = require('./lib/slack');
 const { getTodoistProjects, getSections, createTodoistTask, updateTodoistTask, resolveProjectId, resolveSectionId } = require('./lib/todoist');
 const { parseTaskWithAI } = require('./lib/ai');
+const { getBotToken, getSigningSecret, getNotificationChannel } = require('./lib/workspaces');
+
+// ワークスペース別ルート
+const foresmaRoutes = require('./routes/foresma');
+const winovaRoutes = require('./routes/winova');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -123,9 +128,9 @@ function parseTaskText(text) {
 }
 
 // Slack リクエスト検証（署名シークレット）
-function verifySlackRequest(rawBody, signature, timestamp) {
-  const signingSecret = process.env.SLACK_SIGNING_SECRET;
-  if (!signingSecret) return true; // 未設定の場合は検証スキップ（開発用）
+function verifySlackRequest(rawBody, signature, timestamp, signingSecret = null) {
+  const secret = signingSecret || process.env.SLACK_SIGNING_SECRET;
+  if (!secret) return true; // 未設定の場合は検証スキップ（開発用）
 
   if (!signature || !signature.startsWith('v0=')) return false;
   if (!timestamp) return false;
@@ -139,7 +144,7 @@ function verifySlackRequest(rawBody, signature, timestamp) {
 
   const sigBasestring = `v0:${timestamp}:${rawBody}`;
   const mySig = 'v0=' + crypto
-    .createHmac('sha256', signingSecret)
+    .createHmac('sha256', secret)
     .update(sigBasestring)
     .digest('hex');
 
@@ -705,16 +710,42 @@ app.post('/api/slack/events', async (req, res) => {
   }
 });
 
+// =====================================
+// ワークスペース別ルート
+// =====================================
+app.use('/slack/foresma', foresmaRoutes);
+app.use('/slack/winova', winovaRoutes);
+
 // ヘルスチェック(ngrokなどで動作確認用)
 app.get('/', (req, res) => {
   const status = {
     status: 'running',
     timestamp: new Date().toISOString(),
-    environment: {
+    shared: {
       TODOIST_TOKEN: process.env.TODOIST_TOKEN ? '✅ Set' : '❌ Not set',
-      SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET ? '✅ Set' : '❌ Not set',
-      SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN ? '✅ Set' : '❌ Not set',
       OPENAI_API_KEY: process.env.OPENAI_API_KEY ? '✅ Set' : '❌ Not set',
+    },
+    foresma: {
+      SLACK_BOT_TOKEN: (process.env.SLACK_BOT_TOKEN_FORESMA || process.env.SLACK_BOT_TOKEN) ? '✅ Set' : '❌ Not set',
+      SLACK_SIGNING_SECRET: (process.env.SLACK_SIGNING_SECRET_FORESMA || process.env.SLACK_SIGNING_SECRET) ? '✅ Set' : '❌ Not set',
+    },
+    winova: {
+      SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN_WINOVA ? '✅ Set' : '❌ Not set',
+      SLACK_SIGNING_SECRET: process.env.SLACK_SIGNING_SECRET_WINOVA ? '✅ Set' : '❌ Not set',
+    },
+    endpoints: {
+      foresma: {
+        command: '/slack/foresma/command',
+        interactivity: '/slack/foresma/interactivity'
+      },
+      winova: {
+        command: '/slack/winova/command',
+        interactivity: '/slack/winova/interactivity'
+      },
+      legacy: {
+        command: '/slack/command',
+        interactivity: '/slack/interactivity'
+      }
     }
   };
 
