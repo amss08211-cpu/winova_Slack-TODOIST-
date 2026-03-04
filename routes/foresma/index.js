@@ -9,13 +9,13 @@ const { handleCommand, handleInteractivity, rawBodyParser } = require('../../lib
 const WORKSPACE_ID = 'foresma';
 
 // コマンド
-router.post('/command', rawBodyParser, (req, res) => {
-  handleCommand(req, res, WORKSPACE_ID);
+router.post('/command', rawBodyParser, async (req, res) => {
+  await handleCommand(req, res, WORKSPACE_ID);
 });
 
 // Interactivity
-router.post('/interactivity', (req, res) => {
-  handleInteractivity(req, res, WORKSPACE_ID);
+router.post('/interactivity', async (req, res) => {
+  await handleInteractivity(req, res, WORKSPACE_ID);
 });
 
 module.exports = router;
