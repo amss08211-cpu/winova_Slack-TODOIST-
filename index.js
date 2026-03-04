@@ -17,6 +17,12 @@ const winovaRoutes = require('./routes/winova');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// =====================================
+// ワークスペース別ルート（bodyパーサーの前に配置）
+// =====================================
+app.use('/slack/foresma', foresmaRoutes);
+app.use('/slack/winova', winovaRoutes);
+
 // 担当者マッピング（config/owners.json）
 // ownerAliases: 苗字 or 短い名前 → フルネーム（1対1）
 // ambiguousFamilyNames: 同姓が複数いる苗字 → [フルネーム, ...]。苗字だけ指定されたら必ず聞き返す
@@ -709,12 +715,6 @@ app.post('/api/slack/events', async (req, res) => {
     res.status(200).send('');
   }
 });
-
-// =====================================
-// ワークスペース別ルート
-// =====================================
-app.use('/slack/foresma', foresmaRoutes);
-app.use('/slack/winova', winovaRoutes);
 
 // ヘルスチェック(ngrokなどで動作確認用)
 app.get('/', (req, res) => {

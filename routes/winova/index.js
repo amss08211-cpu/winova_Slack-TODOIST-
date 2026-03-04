@@ -13,8 +13,8 @@ router.post('/command', rawBodyParser, async (req, res) => {
   await handleCommand(req, res, WORKSPACE_ID);
 });
 
-// Interactivity
-router.post('/interactivity', async (req, res) => {
+// Interactivity（bodyパーサーが必要）
+router.post('/interactivity', express.urlencoded({ extended: true }), async (req, res) => {
   await handleInteractivity(req, res, WORKSPACE_ID);
 });
 
