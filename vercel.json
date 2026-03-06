@@ -13,7 +13,17 @@
             }
         },
         {
-            "src": "api/**/*.js",
+            "src": "api/cron/reminder-today.js",
+            "use": "@vercel/node",
+            "config": {
+                "includeFiles": [
+                    "config/**",
+                    "lib/**"
+                ]
+            }
+        },
+        {
+            "src": "api/cron/reminder-overdue.js",
             "use": "@vercel/node",
             "config": {
                 "includeFiles": [
@@ -25,12 +35,16 @@
     ],
     "routes": [
         {
-            "src": "/api/cron/(.*)",
-            "dest": "/api/cron/$1"
+            "src": "/api/cron/reminder-today",
+            "dest": "/api/cron/reminder-today.js"
+        },
+        {
+            "src": "/api/cron/reminder-overdue",
+            "dest": "/api/cron/reminder-overdue.js"
         },
         {
             "src": "/(.*)",
-            "dest": "index.js"
+            "dest": "/index.js"
         }
     ],
     "crons": [
