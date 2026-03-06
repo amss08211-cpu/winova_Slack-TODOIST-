@@ -47,14 +47,5 @@
             "dest": "/index.js"
         }
     ],
-    "crons": [
-        {
-            "path": "/api/cron/reminder-today",
-            "schedule": "0 2 * * *"
-        },
-        {
-            "path": "/api/cron/reminder-overdue",
-            "schedule": "0 2-9 * * *"
-        }
-    ]
+    "crons": []
 }
