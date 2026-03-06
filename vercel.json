@@ -6,7 +6,9 @@
             "use": "@vercel/node",
             "config": {
                 "includeFiles": [
-                    "config/**"
+                    "config/**",
+                    "lib/**",
+                    "routes/**"
                 ]
             }
         },
@@ -23,7 +25,11 @@
     ],
     "routes": [
         {
-            "src": "/((?!api/).*)",
+            "src": "/api/cron/(.*)",
+            "dest": "/api/cron/$1"
+        },
+        {
+            "src": "/(.*)",
             "dest": "index.js"
         }
     ],
