@@ -31,6 +31,16 @@
                     "lib/**"
                 ]
             }
+        },
+        {
+            "src": "api/cron/reminder-upcoming.js",
+            "use": "@vercel/node",
+            "config": {
+                "includeFiles": [
+                    "config/**",
+                    "lib/**"
+                ]
+            }
         }
     ],
     "routes": [
@@ -43,9 +53,18 @@
             "dest": "/api/cron/reminder-overdue.js"
         },
         {
+            "src": "/api/cron/reminder-upcoming",
+            "dest": "/api/cron/reminder-upcoming.js"
+        },
+        {
             "src": "/(.*)",
             "dest": "/index.js"
         }
     ],
-    "crons": []
+    "crons": [
+        {
+            "path": "/api/cron/reminder-today",
+            "schedule": "0 2 * * *"
+        }
+    ]
 }
