@@ -1,5 +1,5 @@
 /**
- * 当日リマインダー Cron エンドポイント
+ * 当日 + 期日超過リマインダー Cron エンドポイント
  * スケジュール: 毎日 11:00 JST (UTC 02:00)
  */
 
@@ -18,7 +18,8 @@ module.exports = async (req, res) => {
   console.log(`[reminder-today] Started at ${new Date().toISOString()}`);
 
   try {
-    const results = await sendReminders('today');
+    // 当日 + 期日超過をまとめて1メッセージで通知
+    const results = await sendReminders('today_overdue');
 
     console.log(`[reminder-today] Completed: sent=${results.sent}, errors=${results.errors.length}`);
 
